@@ -1,0 +1,325 @@
+.build_with_kaniko:
+  # Hidden job to use as an "extends" template
+  # https://docs.gitlab.com/ee/ci/yaml/#hide-jobs
+  tags:
+  - docker
+  variables:
+    CONTAINER_IMAGE_PREFIX: $CI_REGISTRY/
+    CONTAINER_IMAGE_NAMESPACE: kaniko-project
+    CONTAINER_IMAGE_NAME: executor
+    CONTAINER_IMAGE_TAG: debug-wget
+  image:
+    name: ${CONTAINER_IMAGE_PREFIX}${CONTAINER_IMAGE_NAMESPACE}/${CONTAINER_IMAGE_NAME}:${CONTAINER_IMAGE_TAG}
+    entrypoint: [""]
+  script:
+  - start_build_with_kaniko=$(date +%s)
+
+  - if [ -z ${CI_REGISTRY_IMAGE+ABC} ]; then
+  -   echo "This template pushes the container image built by Kaniko to the container registry for this project. $CI_REGISTRY_IMAGE is blank, most likely because the container registry for this project is disabled. A Maintainer can enable the container registry at $CI_PROJECT_URL/edit."
+  -   'false'
+  - fi
+
+  - if ! [ -z ${PATH_TO_DOCKERFILE+ABC} ] && ! [ -z ${PATHS_TO_DOCKERFILES+ABC} ]; then
+  - echo "Please set either PATH_TO_DOCKERFILE or PATHS_TO_DOCKERFILES (or leave us to auto-discover your Dockerfile) but not both."
+  - "false"
+  - fi
+
+  # Build date for opencontainers
+  - BUILDDATE="'$(date '+%FT%T%z' | sed -E -n 's/(\+[0-9]{2})([0-9]{2})$/\1:\2/p')'" #rfc 3339 date
+  - IMAGE_LABELS="$IMAGE_LABELS --label org.opencontainers.image.created=$BUILDDATE --label build-date=$BUILDDATE"
+  # Description for opencontainers
+  - BUILDTITLE=$(echo $CI_PROJECT_TITLE | tr " " "_")
+  - IMAGE_LABELS="$IMAGE_LABELS --label org.opencontainers.image.title=$BUILDTITLE --label org.opencontainers.image.description=$BUILDTITLE"
+  # Add ref.name for opencontainers
+  - IMAGE_LABELS="$IMAGE_LABELS --label org.opencontainers.image.ref.name=$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME"
+  # Build Version Label and Tag from git tag, LastVersionTagInGit was placed by a previous job artifact
+  - if [[ "$VERSIONLABELMETHOD" == "LastVersionTagInGit" ]]; then VERSIONLABEL=$(cat VERSIONTAG.txt); fi
+  - if [[ "$VERSIONLABELMETHOD" == "OnlyIfThisCommitHasVersion" ]]; then VERSIONLABEL=$CI_COMMIT_TAG; fi
+  - if [[ ! -z "$VERSIONLABEL" ]]; then 
+  -   IMAGE_LABELS="$IMAGE_LABELS --label org.opencontainers.image.version=$VERSIONLABEL"
+  -   ADDITIONALTAGLIST="$ADDITIONALTAGLIST $VERSIONLABEL"
+  - fi
+  - if [[ -z ${SKIP_DOCKER_TAG_BRANCH_NAME+ABC} ]]; then
+  -   ADDITIONALTAGLIST="$ADDITIONALTAGLIST $CI_COMMIT_REF_NAME"
+  - fi
+  - if [ -z ${SKIP_DOCKER_TAG_COMMIT_SHORT_SHA+ABC} ]; then
+  - ADDITIONALTAGLIST="$ADDITIONALTAGLIST $CI_COMMIT_SHORT_SHA"
+  - fi
+  - if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then ADDITIONALTAGLIST="$ADDITIONALTAGLIST latest"; fi
+
+  - if [ -z ${FIX_ALL_GOTCHAS_SCRIPT_LOCATION+ABC} ]; then
+  - FIX_ALL_GOTCHAS_SCRIPT_LOCATION=https://$CI_SERVER_HOST/shell-bootstrap-scripts/shell-bootstrap-scripts/-/raw/master/fix_all_gotchas.sh
+  - echo "FIX_ALL_GOTCHAS_SCRIPT_LOCATION was unset, so trying $FIX_ALL_GOTCHAS_SCRIPT_LOCATION."
+  - fi
+  - cat $HOME/.wgetrc || echo "$HOME/.wgetrc does not exist."
+  - ls fix_all_gotchas.sh || (wget $FIX_ALL_GOTCHAS_SCRIPT_LOCATION --output-document fix_all_gotchas.sh --no-clobber && echo "Successfully downloaded $FIX_ALL_GOTCHAS_SCRIPT_LOCATION using wget!") || (wget --help && wget --proxy off $FIX_ALL_GOTCHAS_SCRIPT_LOCATION --output-document fix_all_gotchas.sh) || (wget --no-proxy $FIX_ALL_GOTCHAS_SCRIPT_LOCATION --output-document environment.sh && echo "Successfully downloaded $FIX_ALL_GOTCHAS_SCRIPT_LOCATION using wget!") || (wget --no-proxy --no-check-certificate $FIX_ALL_GOTCHAS_SCRIPT_LOCATION --output-document environment.sh && echo "Successfully downloaded $FIX_ALL_GOTCHAS_SCRIPT_LOCATION using wget!") || curl --verbose $FIX_ALL_GOTCHAS_SCRIPT_LOCATION --output fix_all_gotchas.sh || (echo $SSH_PRIVATE_DEPLOY_KEY > SSH.PRIVATE.KEY && scp -i SSH.PRIVATE.KEY $FIX_ALL_GOTCHAS_SCRIPT_LOCATION fix_all_gotchas.sh && rm SSH.PRIVATE.KEY)
+  - if [ -z ${CLEANUP_SCRIPT_LOCATION+ABC} ]; then
+  - CLEANUP_SCRIPT_LOCATION=https://$CI_SERVER_HOST/shell-bootstrap-scripts/shell-bootstrap-scripts/-/raw/master/cleanup.sh
+  - echo "CLEANUP_SCRIPT_LOCATION was unset, so trying $CLEANUP_SCRIPT_LOCATION."
+  - fi
+  - ls cleanup.sh || wget $CLEANUP_SCRIPT_LOCATION --output-document cleanup.sh --no-clobber || (wget --help && wget --proxy off $CLEANUP_SCRIPT_LOCATION --output-document cleanup.sh --no-clobber) || curl --verbose $CLEANUP_SCRIPT_LOCATION --output cleanup.sh || (echo $SSH_PRIVATE_DEPLOY_KEY > SSH.PRIVATE.KEY && scp -i SSH.PRIVATE.KEY $CLEANUP_SCRIPT_LOCATION cleanup.sh && rm SSH.PRIVATE.KEY)
+
+  # If BASE_IMAGE is set, pass that down to the docker build.
+  - if [ -z ${BASE_IMAGE+ABC} ]; then
+  -   echo "BASE_IMAGE is unset, so leaving it as the default in the Dockerfile."
+  - else
+  -   SCRIPT_ADDED_BUILD_ARGS="$SCRIPT_ADDED_BUILD_ARGS --build-arg BASE_IMAGE=$BASE_IMAGE"
+  - fi
+  # For cleanliness, we would prefer to leave build-args *unset* if they are unset here.
+  # Thus, we don't want to unconditionally pass --build-arg ETC_ENVIRONMENT_LOCATION=$ETC_ENVIRONMENT_LOCATION,
+  # as that would set ETC_ENVIRONMENT_LOCATION to an empty string if ETC_ENVIRONMENT_LOCATION were unset here.
+  # $FIX_ALL_GOTCHAS_SCRIPT_LOCATION might set ETC_ENVIRONMENT_LOCATION for us, so we must make sure to run that script before checking whether ETC_ENVIRONMENT_LOCATION is set.
+  - if [ -z ${FIX_ALL_GOTCHAS_SCRIPT_LOCATION+ABC} ]; then
+  -   echo "FIX_ALL_GOTCHAS_SCRIPT_LOCATION is unset, so leaving it unset in the build."
+  - else
+  -   SCRIPT_ADDED_BUILD_ARGS="$SCRIPT_ADDED_BUILD_ARGS --build-arg FIX_ALL_GOTCHAS_SCRIPT_LOCATION=$FIX_ALL_GOTCHAS_SCRIPT_LOCATION"
+  - fi
+  - if [ -z ${ETC_ENVIRONMENT_LOCATION+ABC} ]; then
+  -   echo "ETC_ENVIRONMENT_LOCATION is unset, so leaving it unset in the build."
+  - else
+  -   SCRIPT_ADDED_BUILD_ARGS="$SCRIPT_ADDED_BUILD_ARGS --build-arg ETC_ENVIRONMENT_LOCATION=$ETC_ENVIRONMENT_LOCATION"
+  - fi
+  - if [ -z ${CLEANUP_SCRIPT_LOCATION+ABC} ]; then
+  -   echo "CLEANUP_SCRIPT_LOCATION is unset, so leaving it unset in the build."
+  - else
+  -   SCRIPT_ADDED_BUILD_ARGS="$SCRIPT_ADDED_BUILD_ARGS --build-arg CLEANUP_SCRIPT_LOCATION=$CLEANUP_SCRIPT_LOCATION"
+  - fi
+  - if [ -z ${OS_PACKAGE_REPOSITORY_URLS+ABC} ]; then
+  -   echo "OS_PACKAGE_REPOSITORY_URLS is unset, so leaving it unset in the build."
+  - else
+  -   SCRIPT_ADDED_BUILD_ARGS="$SCRIPT_ADDED_BUILD_ARGS --build-arg OS_PACKAGE_REPOSITORY_URLS=${OS_PACKAGE_REPOSITORY_URLS// /MAGIC_STRING_TO_REPLACE_SPACE}"
+  - fi
+  - if [ -z ${CI_RUNNER_TAGS+ABC} ]; then
+  -   echo "CI_RUNNER_TAGS is unset, so leaving it unset in the build."
+  # - else BUILD_ARGS="$BUILD_ARGS --build-arg CI_RUNNER_TAGS=\"$CI_RUNNER_TAGS\""
+  - fi
+  - if [ -z ${DOCKER_BASE_IMAGE_PREFIX+ABC} ]; then
+  -   DOCKER_BASE_IMAGE_PREFIX=$CI_REGISTRY/
+  -   echo "DOCKER_BASE_IMAGE_PREFIX was unset, so trying $DOCKER_BASE_IMAGE_PREFIX."
+  - fi
+  - SCRIPT_ADDED_BUILD_ARGS="$SCRIPT_ADDED_BUILD_ARGS --build-arg DOCKER_BASE_IMAGE_PREFIX=$DOCKER_BASE_IMAGE_PREFIX"
+  - if [ -z ${DOCKER_BASE_IMAGE_NAMESPACE+ABC} ]; then
+  -   DOCKER_BASE_IMAGE_NAMESPACE=$CI_PROJECT_NAMESPACE
+  -   echo "DOCKER_BASE_IMAGE_NAMESPACE was unset, so trying $DOCKER_BASE_IMAGE_NAMESPACE."
+  - fi
+  - SCRIPT_ADDED_BUILD_ARGS="$SCRIPT_ADDED_BUILD_ARGS --build-arg DOCKER_BASE_IMAGE_NAMESPACE=$DOCKER_BASE_IMAGE_NAMESPACE"
+  - if [ -z ${DOCKER_BASE_IMAGE_NAME+ABC} ]; then
+  -   DOCKER_BASE_IMAGE_NAME=$CI_PROJECT_NAME
+  -   echo "DOCKER_BASE_IMAGE_NAME was unset, so trying $DOCKER_BASE_IMAGE_NAME."
+  - fi
+  - SCRIPT_ADDED_BUILD_ARGS="$SCRIPT_ADDED_BUILD_ARGS --build-arg DOCKER_BASE_IMAGE_NAME=$DOCKER_BASE_IMAGE_NAME"
+  - if ! [ -z ${DOCKER_BASE_IMAGE_TAG+ABC} ]; then
+  -   SCRIPT_ADDED_BUILD_ARGS="$SCRIPT_ADDED_BUILD_ARGS --build-arg DOCKER_BASE_IMAGE_TAG=$DOCKER_BASE_IMAGE_TAG"
+  - fi
+  - SCRIPT_ADDED_BUILD_ARGS="$SCRIPT_ADDED_BUILD_ARGS --build-arg CI_SERVER_HOST=$CI_SERVER_HOST"
+  # Currently, kaniko does not support Docker BuildKit --secrets.
+  # However, currently, kaniko does not save any --build-arg values in the history.
+  # https://github.com/GoogleContainerTools/kaniko/issues/1327
+  # But this is not guaranteed to always remain true.
+  # For now, until kaniko sorts out how they want to handle secrets,
+  # we smuggle in any secrets with a magic variable name that is not stored by either docker build or kaniko.
+  # https://docs.docker.com/engine/reference/builder/#predefined-args
+  - if [ -z ${SSH_PRIVATE_DEPLOY_KEY+ABC} ]; then
+  - echo "SSH_PRIVATE_DEPLOY_KEY is unset, so leaving FTP_PROXY unset in the build."
+  - FTP_OPTION=""
+  - else
+  # - DOLLAR_SSH_PRIVATE_DEPLOY_KEY='$SSH_PRIVATE_DEPLOY_KEY'
+  # - QUOTED_DOLLAR_SSH_PRIVATE_DEPLOY_KEY='"$SSH_PRIVATE_DEPLOY_KEY"'
+  # - BUILD_ARGS="$BUILD_ARGS --build-arg FTP_PROXY=$SSH_PRIVATE_DEPLOY_KEY"
+  - FTP_OPTION="--build-arg FTP_PROXY=$SSH_PRIVATE_DEPLOY_KEY"
+  - fi
+  # want to be able to print out the build-args for verification, so handle this separately
+
+  - if [ -z ${PROXY_CA_PEM+ABC} ]; then echo "PROXY_CA_PEM is unset, so assuming you do not need an additional .crt bundle."; else
+  # $PROXY_CA_PEM should be a filename at this stage.
+  -   if [ -z ${SSL_CERT_DIR+ABC} ]; then
+  -     ls /kaniko/ssl/certs/
+  -     cat $PROXY_CA_PEM | tr -d '\r' >> /kaniko/ssl/certs/additional-ca-cert-bundle.crt
+  -   else
+  -     ls $SSL_CERT_DIR
+  -     cat $PROXY_CA_PEM | tr -d '\r' >> $SSL_CERT_DIR/additional-ca-cert-bundle.crt
+  -   fi
+  - fi
+
+  - echo "FORMATTEDTAGLIST = $FORMATTEDTAGLIST"
+  - echo "IMAGE_LABELS = $IMAGE_LABELS"
+  - echo "SCRIPT_ADDED_BUILD_ARGS = $SCRIPT_ADDED_BUILD_ARGS"
+  # BUILD_ARGS might have passed-in secrets, so don't print those
+
+  - if ! [ -z ${BUILD_ARGS+ABC} ]; then
+  -   echo "BUILD_ARGS already has something passed in, that's fine"
+  - fi
+  - BUILD_ARGS="$BUILD_ARGS $SCRIPT_ADDED_BUILD_ARGS"
+
+  - if [ -z ${DOCKER_CONFIG+ABC} ]; then
+  -   DOCKER_CONFIG=/kaniko/.docker
+  -   echo "DOCKER_CONFIG was unset, so trying $DOCKER_CONFIG."
+  - fi
+  - mkdir -p $DOCKER_CONFIG
+  - echo "{" > $DOCKER_CONFIG/config.json
+  - echo "\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n $CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD | base64)\"}}" >> $DOCKER_CONFIG/config.json
+  - if [ -z ${DNS_IPs_JSON_list+ABC} ]; then
+  - echo "DNS_IPs_JSON_list is unset, so assuming you do not need DNS set up."
+  - else
+  - echo ",\"dns\":$DNS_IPs_JSON_list" >> $DOCKER_CONFIG/config.json
+  - fi
+  - echo "}" >> $DOCKER_CONFIG/config.json
+
+  - if [ -z ${PATH_TO_DOCKERFILE+ABC} ]; then
+  -   PATH_TO_DOCKERFILE=dockerfiles/test.Dockerfile
+  -   echo "PATH_TO_DOCKERFILE was unset, so trying $PATH_TO_DOCKERFILE."
+  -   if [ -z ${PATHS_TO_DOCKERFILES+ABC} ]; then
+  -     PATHS_TO_DOCKERFILES=$(find . -maxdepth 3 -name Dockerfile)
+  -   fi
+  - fi
+  # --build-arg HTTP_PROXY=$http_proxy is needed for e.g. apk add, when we fetch http://dl-cdn.alpinelinux.org/alpine/v3.12/main/x86_64/APKINDEX.tar.gz
+  - if [ -z "$PATHS_TO_DOCKERFILES" ]; then
+  - ls $PATH_TO_DOCKERFILE
+  - PATHS_TO_DOCKERFILES=$PATH_TO_DOCKERFILE
+  - fi
+
+  # If you do want to do multiple builds in a single job, we will gamely attempt that,
+  # (though Kaniko doesn't like it much)
+  # and for simple builds it will often work.
+  # However, if there is only one Dockerfile we'll be building, we want to know that so that we can simplify the build process.
+  - NUMBER_OF_DOCKERFILES=0
+  - for PATH_TO_DOCKERFILE in $PATHS_TO_DOCKERFILES; do
+  -   NUMBER_OF_DOCKERFILES=$((NUMBER_OF_DOCKERFILES + 1))
+  -   echo "$NUMBER_OF_DOCKERFILES $PATH_TO_DOCKERFILE"
+  - done
+  - if [ $NUMBER_OF_DOCKERFILES -lt 1 ]; then
+  - echo "No Dockerfile found!"
+  - "false"
+  - fi
+  - if [ $NUMBER_OF_DOCKERFILES -gt 1 ]; then
+  - echo "If you do want to do multiple builds in a single job, we will gamely attempt that (though Kaniko doesn't like it much), and for simple builds it will often work."
+  - fi
+
+  - for PATH_TO_DOCKERFILE in $PATHS_TO_DOCKERFILES; do
+  - echo "$PATH_TO_DOCKERFILE in $PATHS_TO_DOCKERFILES"
+  # https://docs.gitlab.com/ee/user/packages/container_registry/#image-naming-convention
+  - DIRNAME_FOR_DOCKERFILE=$(dirname "$PATH_TO_DOCKERFILE")
+  - echo $DIRNAME_FOR_DOCKERFILE
+  - if [ $NUMBER_OF_DOCKERFILES -gt 1 ]; then
+  - "if [ ${DIRNAME_FOR_DOCKERFILE: 0 : 1} != '.' ]; then"
+  -   'echo "${DIRNAME_FOR_DOCKERFILE: 0 : 1}"'
+  -   'false'
+  - fi
+  - if [ -z ${DOCKER_IMAGE_SUB_NAME} ]; then
+  -   "DOCKER_IMAGE_SUB_NAME=${DIRNAME_FOR_DOCKERFILE: 1}"
+  - else
+  -   echo "DOCKER_IMAGE_SUB_NAME=$DOCKER_IMAGE_SUB_NAME"
+  -   if [ $NUMBER_OF_DOCKERFILES -gt 1 ]; then
+  -     'false'
+  -   fi
+  - fi
+  - fi # endif more than one Dockerfile
+  - echo "$DOCKER_IMAGE_SUB_NAME will be the sub-namespace"
+  - if ! [ -z ${DOCKER_IMAGE_SUB_NAME} ]; then
+  - "DOCKER_IMAGE_SUB_NAME_CONNECTOR=${DOCKER_IMAGE_SUB_NAME: 0 : 1}"
+  - echo $DOCKER_IMAGE_SUB_NAME_CONNECTOR
+  - if [ $DOCKER_IMAGE_SUB_NAME_CONNECTOR != '/' ]; then
+  - "false"
+  - fi # endif DOCKER_IMAGE_SUB_NAME_CONNECTOR != '/'
+  - fi # endif DOCKER_IMAGE_SUB_NAME empty
+  - ls $PATH_TO_DOCKERFILE
+  - FORMATTEDTAGLIST=""
+  - if [[ -n "$ADDITIONALTAGLIST" ]]; then 
+  -   for TAG in $ADDITIONALTAGLIST; do 
+  -     FORMATTEDTAGLIST="${FORMATTEDTAGLIST} --tag $CI_REGISTRY_IMAGE$DOCKER_IMAGE_SUB_NAME:$TAG ";
+  -   done; 
+  - fi
+  # Reformat Docker tags to kaniko's --destination argument
+  - FORMATTEDTAGLIST=$(echo "${FORMATTEDTAGLIST}" | sed s/\-\-tag/\-\-destination/g)
+  - if [ $NUMBER_OF_DOCKERFILES -gt 1 ]; then
+  # If we have multiple Dockerfiles, we don't want to rebuild all of them every time.
+  # https://gitlab.com/gitlab-org/gitlab/-/issues/216348
+  - CLEANUP_OPTION="--cleanup"
+  - else
+  - CLEANUP_OPTION=""
+  - fi
+
+  - right_before_kaniko_executor=$(date +%s)
+  # build-args might be secret, but tags and labels will be visible in the Docker registry anyway
+  - if [ -z ${KANIKO_EXECUTOR+ABC} ]; then
+  -   KANIKO_EXECUTOR=/kaniko/executor
+  -   echo "KANIKO_EXECUTOR was unset, so trying $KANIKO_EXECUTOR."
+  - fi
+  - echo "$KANIKO_EXECUTOR --context $CI_PROJECT_DIR --dockerfile $PATH_TO_DOCKERFILE $FORMATTEDTAGLIST $IMAGE_LABELS $CLEANUP_OPTION"
+  - if [ -z ${SSH_PRIVATE_DEPLOY_KEY+ABC} ]; then
+  # - /kaniko/executor --context $CI_PROJECT_DIR --dockerfile $PATH_TO_DOCKERFILE $BUILD_ARGS "$FTP_OPTION" $FORMATTEDTAGLIST $IMAGE_LABELS $CLEANUP_OPTION
+  -   $KANIKO_EXECUTOR --context $CI_PROJECT_DIR --dockerfile $PATH_TO_DOCKERFILE $BUILD_ARGS --build-arg CI_RUNNER_TAGS="$CI_RUNNER_TAGS" $FORMATTEDTAGLIST $IMAGE_LABELS $CLEANUP_OPTION
+  - else
+  -   $KANIKO_EXECUTOR --context $CI_PROJECT_DIR --dockerfile $PATH_TO_DOCKERFILE $BUILD_ARGS --build-arg FTP_PROXY="$SSH_PRIVATE_DEPLOY_KEY" --build-arg CI_RUNNER_TAGS="$CI_RUNNER_TAGS" $FORMATTEDTAGLIST $IMAGE_LABELS $CLEANUP_OPTION
+  - fi
+  - echo "$KANIKO_EXECUTOR took $(( $(date +%s) - right_before_kaniko_executor)) seconds"
+  - echo "build_with_kaniko took $(( $(date +%s) - start_build_with_kaniko)) seconds total"
+  - unset DOCKER_IMAGE_SUB_NAME
+  - done
+
+.kaniko_save_image_as_file:
+  tags:
+  - docker
+  variables:
+    TAR_FILE_PATH: image.docker.tar
+    TAR_BZ2_FILE_PATH: image.docker.tar.bz2
+    NEW_IMAGE_TAG: 'new_name:latest'
+    IMAGE_TO_SAVE_PREFIX: $CI_REGISTRY/
+    IMAGE_TO_SAVE_NAMESPACE: shell-bootstrap-scripts
+    IMAGE_TO_SAVE_NAME: tar-jq-image
+    DEFAULT_IMAGE_TO_SAVE_TAG: tar-jq-alpine
+    KANIKO_CONTAINER_IMAGE_PREFIX: $CI_REGISTRY/
+    KANIKO_CONTAINER_IMAGE_NAMESPACE: kaniko-project
+    KANIKO_CONTAINER_IMAGE_NAME: executor
+    KANIKO_CONTAINER_IMAGE_TAG: debug-alpine
+  image:
+    name: ${KANIKO_CONTAINER_IMAGE_PREFIX}${KANIKO_CONTAINER_IMAGE_NAMESPACE}/${KANIKO_CONTAINER_IMAGE_NAME}:${KANIKO_CONTAINER_IMAGE_TAG}
+    entrypoint: [""]
+  script:
+  # We might want to give IMAGE_TO_SAVE_TAG a different name in a trigger clause, like BRANCH_TO_USE.
+  # With DEFAULT_IMAGE_TO_SAVE_TAG, we can set DEFAULT_IMAGE_TO_SAVE_TAG on the job,
+  # and also set IMAGE_TO_SAVE_TAG: $ALTERNATE_NAME, so that if ALTERNATE_NAME is set then it will override IMAGE_TO_SAVE_TAG.
+  - if [ -z ${IMAGE_TO_SAVE_TAG} ]; then
+  -   IMAGE_TO_SAVE_TAG=${DEFAULT_IMAGE_TO_SAVE_TAG}
+  - fi
+  - if [ -z ${IMAGE_TO_SAVE+ABC} ]; then
+  -   IMAGE_TO_SAVE=${IMAGE_TO_SAVE_PREFIX}${IMAGE_TO_SAVE_NAMESPACE}/${IMAGE_TO_SAVE_NAME}:${IMAGE_TO_SAVE_TAG}
+  - fi
+
+  - if [ -z ${DOCKER_CONFIG+ABC} ]; then
+  -   DOCKER_CONFIG=/kaniko/.docker
+  -   echo "DOCKER_CONFIG was unset, so trying $DOCKER_CONFIG."
+  - fi
+  - mkdir -p $DOCKER_CONFIG
+  - echo "{" > $DOCKER_CONFIG/config.json
+  - echo "\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n $CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD | base64)\"}}" >> $DOCKER_CONFIG/config.json
+  - if [ -z ${DNS_IPs_JSON_list+ABC} ]; then
+  - echo "DNS_IPs_JSON_list is unset, so assuming you do not need DNS set up."
+  - else
+  - echo ",\"dns\":$DNS_IPs_JSON_list" >> $DOCKER_CONFIG/config.json
+  - fi
+  - echo "}" >> $DOCKER_CONFIG/config.json
+
+  - echo "FROM $IMAGE_TO_SAVE" > Dockerfile
+  - if ! [ -d $(dirname $TAR_FILE_PATH) ]; then
+  -   echo "Warning! $(dirname $TAR_FILE_PATH) does not exist; creating it now."
+  -   mkdir -p $(dirname $TAR_FILE_PATH)
+  - fi
+
+  - if [ -z ${KANIKO_EXECUTOR+ABC} ]; then
+  -   KANIKO_EXECUTOR=/kaniko/executor
+  -   echo "KANIKO_EXECUTOR was unset, so trying $KANIKO_EXECUTOR."
+  - fi
+  - $KANIKO_EXECUTOR --dockerfile=Dockerfile --no-push --image-name-tag-with-digest-file=image_name_tag_with_digest_file --tarPath=${TAR_FILE_PATH} --destination=${NEW_IMAGE_TAG}
+  - if ! [ -z ${TRY_BZ2+ABC} ]; then
+  -   bzip2 -9 -k $TAR_FILE_PATH
+  -   stat -c %s $TAR_FILE_PATH
+  -   stat -c %s $TAR_BZ2_FILE_PATH
+  # For the little jq Alpine image the bzipped version is actually larger.
+  -   mv $TAR_FILE_PATH.bz2 $TAR_BZ2_FILE_PATH
+  - fi
+  artifacts:
+    paths:
+    - ${TAR_FILE_PATH}
+    - image_name_tag_with_digest_file
+    expire_in: 1 hour

@@ -1,0 +1,361 @@
+image: python:alpine
+
+stages:
+  - build-requirements-image
+  - build-image
+  - pages
+  - build
+  - test
+  - deploy
+
+# https://docs.gitlab.com/ee/ci/yaml/includes.html#re-using-a-before_script-template
+include:
+  - local: '.before_script.yml'
+  - local: '.build_with_kaniko.yml'
+
+build-docker-image-with-requirements:
+  # This job is to be avoided, since in most cases
+  # a Docker image that contains none of the code from this repository should not be stored with this repository.
+  # However, sometimes the project's requirements are so idiosyncratic that it seems to make more sense to store the requirements-only image with the repository.
+  extends: .build_with_kaniko
+  variables:
+    PATH_TO_DOCKERFILE: dockerfiles/requirements.Dockerfile
+    DOCKER_IMAGE_SUB_NAME: /requirements
+    SKIP_DOCKER_TAG_COMMIT_SHORT_SHA: 1
+    DOCKER_BASE_IMAGE_NAMESPACE: pythonpackagesubuntu
+    DOCKER_BASE_IMAGE_NAME: python-machine-learning-ubuntu
+    DOCKER_BASE_IMAGE_TAG: pytorch-ubuntu
+  stage: build-requirements-image
+  rules:
+  - exists:
+    - dockerfiles/requirements.Dockerfile
+    # https://docs.gitlab.com/ee/ci/yaml/#complex-rule-clauses
+    changes:
+    - dockerfiles/requirements.Dockerfile
+    - .gitlab-ci.yml
+    - .build_with_kaniko.yml
+
+build-for-gitlab-project-registry:
+  extends: .build_with_kaniko
+  only:
+    variables:
+      - $BUILD_DOCKER_IMAGE != null
+  variables:
+    SKIP_DOCKER_TAG_COMMIT_SHORT_SHA: 1
+    # BASE_IMAGE: $CI_REGISTRY_IMAGE/requirements:$CI_COMMIT_REF_NAME
+    DOCKER_BASE_IMAGE_NAMESPACE: $CI_PROJECT_NAMESPACE
+    DOCKER_BASE_IMAGE_NAME: $CI_PROJECT_NAME/requirements
+    DOCKER_BASE_IMAGE_TAG: $CI_COMMIT_REF_NAME
+  stage: build-image
+  environment:
+    #This is only here for completeness; since there are no CI CD Variables with this scope, the project defaults are used
+    # to push to this projects docker registry
+    name: push-to-gitlab-project-registry
+
+.build-wheels:
+  stage: build-image
+  tags:
+  - docker
+  script:
+  - python -m pip install wheel
+  # - python setup.py bdist_wheel
+  - python -m pip wheel . --wheel-dir dist
+  - ls dist
+  - if ! [ -z ${BUILD_ONLY_WHEELS_NOT_INSTALLED_HERE+ABC} ]; then
+  # Surprisingly, pip makes it hard to check whether packages are installed from Python, but easy from shell scripting.
+  -   for wheelfile in $(ls dist); do
+  -     distributionName=$(python -c "import wheel.wheelfile; import os; print(wheel.wheelfile.WheelFile(os.path.join('dist', '$wheelfile')).parsed_filename.group('name'))")
+  -     if python -m pip show $distributionName; then
+  -       rm dist/$wheelfile
+  -     fi
+  -   done
+  - fi
+  artifacts:
+    paths:
+    # For GitLab Pages, the artifact path *must* be "public".
+    - 'dist/*.whl'
+    expire_in: 1 hour
+
+build-wheels:
+  extends: .build-wheels
+  rules:
+  - if: '($DEPLOY_TO_INDEX != null || $BUILD_WHEEL != null) && $BUILD_ONLY_WHEELS_NOT_INSTALLED_HERE == null'
+  variables:
+    # These variables can be overridden by setting them on the project.
+    # https://docs.gitlab.com/ee/ci/variables/#priority-of-cicd-variables
+    DOCKER_IMAGE_PREFIX: $CI_REGISTRY/
+    DOCKER_IMAGE_NAMESPACE: pythonpackagesalpine
+    DOCKER_IMAGE_NAME: basic-python-packages-pre-installed-on-alpine
+    DOCKER_IMAGE_TAG: wheel-alpine
+  image: ${DOCKER_IMAGE_PREFIX}${DOCKER_IMAGE_NAMESPACE}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}
+
+build-some-wheels:
+  extends: .build-wheels
+  rules:
+  - if: '($DEPLOY_TO_INDEX != null || $BUILD_WHEEL != null) && $BUILD_ONLY_WHEELS_NOT_INSTALLED_HERE != null'
+  image: $BUILD_ONLY_WHEELS_NOT_INSTALLED_HERE
+
+.test-built-wheel:
+  stage: test
+  dependencies: ["build-wheels", "build-some-wheels"]
+  tags:
+  - docker
+  script:
+  # - python -m pip download click --dest dist/
+  # https://thilinamad.medium.com/install-python-packages-via-pip-without-an-internet-connection-b3dee83b4c2d
+  - python -m pip install --no-index --find-links=dist/ feature_anomaly_detection
+  # Since you can simply point --find-links at a directory containing wheels, you don't really need the index-generator package (which seems to have trouble generating links to local files, and probably needs to be fixed to use absolute paths).
+
+test-built-wheel:
+  extends: .test-built-wheel
+  rules:
+    - if: '($DEPLOY_TO_INDEX != null || $BUILD_WHEEL != null) && $BUILD_ONLY_WHEELS_NOT_INSTALLED_HERE == null'
+  variables:
+    # These variables can be overridden by setting them on the project.
+    # https://docs.gitlab.com/ee/ci/variables/#priority-of-cicd-variables
+    DOCKER_BASE_IMAGE_PREFIX: $CI_REGISTRY/
+    DOCKER_BASE_IMAGE_NAMESPACE: pythonpackagesalpine
+    DOCKER_BASE_IMAGE_NAME: basic-python-packages-pre-installed-on-alpine
+    DOCKER_BASE_IMAGE_TAG: pip-alpine
+  image: ${DOCKER_BASE_IMAGE_PREFIX}${DOCKER_BASE_IMAGE_NAMESPACE}/${DOCKER_BASE_IMAGE_NAME}:${DOCKER_BASE_IMAGE_TAG}
+
+test-built-wheel-on-particular-image:
+  extends: .test-built-wheel
+  rules:
+    - if: '($DEPLOY_TO_INDEX != null || $BUILD_WHEEL != null) && $BUILD_ONLY_WHEELS_NOT_INSTALLED_HERE != null'
+  image: $BUILD_ONLY_WHEELS_NOT_INSTALLED_HERE
+
+# In general we want to use tox -e docs, but GitLab.com will not deploy Pages
+# if the pages build fails.
+# The pages build will fail if you use tox -e docs with a link to your GitLab
+# Pages documentation that is not yet deployed, because tox -e docs includes
+# sphinx-build -b linkcheck. So the pages will never get deployed...
+# That's why we deploy pages with no checks here.
+# The tests will still run linkcheck on the documentation.
+# Since "It may take up to 30 minutes before the site is available after the
+# first deployment." (per GitLab), the tests will still fail for a little
+# while.
+# The magic around GitLab pages is in the name of the job. It has to be named "pages", and nothing else.
+pages:
+  variables:
+    # These variables can be overridden by setting them on the project.
+    # https://docs.gitlab.com/ee/ci/variables/#priority-of-cicd-variables
+    DOCKER_BASE_IMAGE_PREFIX: $CI_REGISTRY/
+    DOCKER_BASE_IMAGE_NAMESPACE: pythonpackagesalpine
+    DOCKER_BASE_IMAGE_NAME: basic-python-packages-pre-installed-on-alpine
+    DOCKER_BASE_IMAGE_TAG: tox-alpine
+  image: ${DOCKER_BASE_IMAGE_PREFIX}${DOCKER_BASE_IMAGE_NAMESPACE}/${DOCKER_BASE_IMAGE_NAME}:${DOCKER_BASE_IMAGE_TAG}
+  tags:
+  - docker
+  stage: build
+  # On GitLab, the stages are build->test->deploy.
+  # If the test stage fails, the deploy stage is skipped.
+  script:
+  - python -m pip install -r docs/requirements.txt
+
+  # WordPress rejects uploading these kinds of files, but we can host a simple conda channel on GitLab Pages.
+  # The new Miniconda makes empty channels/indices that are actually quite large and complex.
+  # We'd rather not include all that in a git repo, but we also don't particularly want to generate it on-the-fly
+  # in both the pages job and the test job. (We'd need it in the test job so the link to the conda-channel isn't broken.)
+  # For now we're including just an index.html with all its links broken.
+  # (sphinx -b linkcheck does not check links in static HTML.)
+  # That gives users a place they can visit that's not a 404, and since it's clearly empty, it's clear why they can't install from the conda-channel (if the most recent build did not build a conda package).
+  - ls /bin/sh
+  - ls /bin
+  - python -c "import sys; print(sys.platform)"
+  - if command -v conda; then echo "conda found"; else echo "conda not found"; fi
+  - mkdir --parents docs/_static
+  - mkdir --parents docs/_static/conda-channel
+  - if command -v conda; then
+  - if [ "$CONDA_DEFAULT_ENV" = "test-env" ]; then
+  # How should we decide whether or not to build a conda package?
+  # The thing is that building a conda package takes additional build time,
+  # and many people don't use them.
+  # For now, the magic env name is what controls it.
+  - right_before_conda_build=$(date +%s)
+  - conda info
+  - apk add bash
+  - mkdir docs/_static/conda-channel/linux-64
+  # $CONDA_DIR does not contain conda-bld
+  # Adding --bootstrap pointed at an environment containing all of the requirements (obtained by conda installing python-nameless and then conda uninstalling python-nameless) does not seem to reduce build time at all.
+  # Resource usage summary Total time 0:01:13.5 versus Resource usage summary Total time 0:01:12.3
+  - conda build conda.recipe --channel conda-forge --output-folder docs/_static/conda-channel/ --no-test
+  - echo "Building the conda package took $(( $(date +%s) - right_before_conda_build)) seconds total"
+  - ls docs/_static/conda-channel/
+  - ls docs/_static/conda-channel/linux-64/
+  - conda convert `ls docs/_static/conda-channel/linux-64/*.tar.bz2` --platform all --output-dir docs/_static/conda-channel/
+  # conda index doesn't seem to actually make any additional files beyond what conda build already makes
+  - conda index docs/_static/conda-channel/
+  - echo "Building the conda channel took $(( $(date +%s) - right_before_conda_build)) seconds total"
+    ; else echo "The conda env named test-env is not activated, so not building a conda package."; fi
+    ; else
+    echo "conda not found in this container, so not building a conda package."
+    ; fi
+
+  - sphinx-build -E -b html docs dist/docs
+
+  # https://www.sphinx-doc.org/en/master/usage/configuration.html#confval-html_static_path warns that it doesn't include .files, but that seems to be only at the top level, so .files in the conda-channel are still included.
+  - if [ -d docs/_static/conda-channel ] && [ ! -d dist/docs/_static/conda-channel ]; then
+  - mv docs/_static/conda-channel dist/docs/_static
+  - fi
+
+  - mv dist/docs/ public/
+  - echo "Everything after pulling the Docker image took $(( $(date +%s) - right_after_pull_docker_image)) seconds total"
+  artifacts:
+    paths:
+    # For GitLab Pages, the artifact path *must* be "public".
+    - public
+  rules:
+  - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH || $CI_PIPELINE_SOURCE == 'web'
+    changes:
+      - docs/**/*
+
+test:
+  variables:
+    CONTAINER_IMAGE_PREFIX: $CI_REGISTRY/
+    CONTAINER_IMAGE_NAMESPACE: video-anomaly-detection
+    CONTAINER_IMAGE_NAME: fads-image
+    CONTAINER_IMAGE_TAG: from-pytorch
+  image: ${CONTAINER_IMAGE_PREFIX}${CONTAINER_IMAGE_NAMESPACE}/${CONTAINER_IMAGE_NAME}:${CONTAINER_IMAGE_TAG}
+  tags:
+  - docker
+  stage: test
+  # https://docs.gitlab.com/ee/ci/yaml/#dependencies
+  # By default, all artifacts from all previous stages are passed.
+  # And the entire website of a Pages job must be in the artifacts.
+  # This can take a nontrivial amount of time, especially if you're hosting a conda package that way,
+  # or if the gitlab-runner is pretty far from the GitLab instance server.
+  # We want the Pages job to run first because we want to immediately see our changes to the documentation
+  # without waiting on the testing to double-check that we don't have any broken links and such.
+  # Thus the test job comes after the Pages job, but skips downloading artifacts.
+  dependencies: []
+  script:
+  # We install the package separately so that we can continuously monitor how long installation takes.
+  # Note that pip install . will always reinstall the package even if it is already installed.
+  # However, its dependencies will not be reinstalled.
+  # If installation nevertheless takes a nontrivial amount of time, and you're building a Docker image anyway,
+  # you could skip reinstalling here.
+  - git --version || apk add git || apt-get install --assume-yes git
+  - right_before_pip_install=$(date +%s)
+  - python -m pip install .
+  - echo "Installing your package took $(( $(date +%s) - right_before_pip_install)) seconds total"
+  # If using an image that does not include tox, we will
+  # need to pip install tox here.
+  - python -m pip install tox
+
+  # apk add any needed packages not included in the image.
+  # check-manifest, used in tox -e check, requires git,
+  # so we need to either use an image that includes git or
+  # apk add git here.
+
+  - git --version || echo "git is not installed."
+  - python --version
+  - python2 --version || echo "python2 is not installed."
+  - virtualenv --version || echo "virtualenv is not installed."
+  - python -m pip --version
+  # When testing locally, we might not want to set tox sitepackages=true,
+  # because the local machine might have all kinds of weird things in the
+  # environment. But for continuous integration, we do want sitepackages=true,
+  # because it allows us to use a Docker image with some packages already
+  # installed to accelerate testing.
+  # However, Pygments presents a problem. Lots of Docker images you might want to use
+  # have older versions of Pygments that will break your build.
+  # (sphinx uses Pygments and so does readme-renderer, used by tox -e check.)
+  # pkg_resources.VersionConflict (Pygments 2.4.2 (/opt/conda/envs/test-env/lib/python3.7/site-packages), Requirement.parse('Pygments>=2.5.1'))
+  # If an old version of Pygments is installed, we upgrade it first.
+  - if python -m pip show Pygments; then python -m pip install --upgrade Pygments; fi
+  # Note that upgrading sphinx (as we might be about to do) might not automatically upgrade Pygments,
+  # hence specifically checking for Pygments first.
+  - (python -m sphinx --version && python -c "import sphinx; sphinx.version_info < (3,1,2,'final',0) and print('linkcheck can spuriously fail on older versions of Sphinx. If you are seeing anything like 403 Client Error Forbidden, consider upgrading Sphinx.')") || echo "sphinx is not installed."
+  - python -m tox --version
+  - uname --all
+  - lsb_release --all || echo "lsb_release is not supported on this host."
+  - LC_ALL=C.UTF-8 LANG=C.UTF-8 python -m feature_anomaly_detection --help || echo "feature_anomaly_detection is not installed, tox will install it."
+  - start_tox=$(date +%s)
+  # tox itself respects skip_missing_interpreters, but tox-wheel does not.
+  - LC_ALL=C.UTF-8 LANG=C.UTF-8 TOXENV='check,docs,py38,report' python -m tox --sitepackages
+  - echo "tox tests took $(( $(date +%s) - start_tox)) seconds"
+  - echo "Everything after pulling the Docker image took $(( $(date +%s) - right_after_pull_docker_image)) seconds total"
+  only:
+    variables:
+      - $BUILD_DOCKER_IMAGE == null
+  # https://github.com/ionelmc/tox-wheel/blob/master/src/tox_wheel/plugin.py#L158
+  # tox-wheel literally just runs pip wheel --no-deps --use-pep517 --wheel-dir dist/
+  # --use-pep517 is *not* the cause of the "SetuptoolsDeprecationWarning setuptools.installer is deprecated. Requirements should be satisfied by a PEP 517 installer."
+  artifacts:
+    paths:
+    - 'dist/*.whl'
+    expire_in: 1 hour
+
+
+
+test-built-image:
+  extends: test
+  only:
+    variables:
+      - $BUILD_DOCKER_IMAGE != null
+  image:
+    name: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME
+    entrypoint: [""]
+
+trigger-notebook:
+  trigger:
+    project: video-anomaly-detection/feature-anomaly-detection-notebook
+    strategy: depend
+  variables:
+    CONTAINER_IMAGE_TAG: $CI_COMMIT_REF_NAME
+
+upload-to-PyPI:
+  stage: deploy
+  rules:
+    - if: '$DEPLOY_TO_INDEX != null'
+    # The additional flag variable $DEPLOY_TO_INDEX is required so that you can set the three nontrivial variables in your configuration and leave them there, and the upload will only happen when you manually run a pipeline with $DEPLOY_TO_INDEX set.
+      # You can instead set when: manual here, but then your pipelines will be cluttered with many jobs that should never run.
+    # You *can* set $DEPLOY_TO_INDEX in your configuration, in which case the upload will run every time.
+    # In addition to wasting gitlab-runner time, that can mean the index server would have the same version number overwritten.
+    # Some index servers will cheerfully accept this and overwrite the package without error.
+    # Anyone who was *using* the uploaded indexed version which becomes inaccessible might be less cheerful.
+  dependencies: ["build-wheels"]
+  tags:
+  - docker
+  variables:
+    # These variables can be overridden by setting them on the project.
+    # https://docs.gitlab.com/ee/ci/variables/#priority-of-cicd-variables
+    DOCKER_BASE_IMAGE_PREFIX: $CI_REGISTRY/
+    DOCKER_BASE_IMAGE_NAMESPACE: pythonpackagesalpine
+    DOCKER_BASE_IMAGE_NAME: python-networking-alpine
+    DOCKER_BASE_IMAGE_TAG: twine-alpine
+  image: ${DOCKER_BASE_IMAGE_PREFIX}${DOCKER_BASE_IMAGE_NAMESPACE}/${DOCKER_BASE_IMAGE_NAME}:${DOCKER_BASE_IMAGE_TAG}
+  script:
+  - python -m pip install twine wheel
+  - ls dist
+  # We do not need to python setup.py bdist_wheel, because the wheel is inherited as an artifact.
+  - python setup.py sdist
+  - ls dist
+  - SDIST=$(ls dist/*.tar.gz)
+  - DISTRIBUTION_NAME=$(python -c "import pkginfo; print(pkginfo.SDist('$SDIST').name)")
+  - echo $DISTRIBUTION_NAME
+  #- python -m twine upload --help
+  - if [ -z ${TWINE_REPOSITORY_URL+ABC} ]; then
+  -   TWINE_REPOSITORY_URL=$PYPI_URL
+  - fi
+  - if [ -z ${PYPI_USERNAME} ] || [ -z ${PYPI_PASSWORD} ]; then echo "We need PYPI_USERNAME and PYPI_PASSWORD to upload to the PyPI."; false; fi
+  - echo "twine upload --repository-url $TWINE_REPOSITORY_URL dist/$DISTRIBUTION_NAME-*.whl dist/$DISTRIBUTION_NAME-*.tar.gz"
+  - python -m twine upload --verbose --repository-url $TWINE_REPOSITORY_URL --username $PYPI_USERNAME --password $PYPI_PASSWORD dist/$DISTRIBUTION_NAME-*.whl dist/$DISTRIBUTION_NAME-*.tar.gz
+  # Immediately turn around and try to test that we really can pip install it now.
+  # If you value your sanity, do not ask why we need to PIP_INDEX_URL=$PIP_INDEX_URL PIP_EXTRA_INDEX_URL=$PIP_EXTRA_INDEX_URL.
+  - if [ -z ${INDEX_TO_INSTALL_FROM+ABC} ]; then
+  -   INDEX_TO_INSTALL_FROM=$TWINE_REPOSITORY_URL/simple
+  - fi
+  - PIP_INDEX_URL=$INDEX_TO_INSTALL_FROM python -m pip install --no-deps $DISTRIBUTION_NAME
+
+upload-to-GitLab-PyPI:
+  extends: upload-to-PyPI
+  rules:
+  - if: '$DEPLOY_TO_GITLAB_REGISTRY != null'
+  variables:
+    PYPI_USERNAME: gitlab-ci-token
+    PYPI_PASSWORD: ${CI_JOB_TOKEN}
+    TWINE_REPOSITORY_URL: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi
+    INDEX_TO_INSTALL_FROM: https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/packages/pypi/simple
+
